@@ -213,6 +213,7 @@ static name_keymap_t command_names[] = {
     ADD_KEYMAP_NAME (PutOtherTagged),
     ADD_KEYMAP_NAME (Select),
     ADD_KEYMAP_NAME (Unselect),
+    ADD_KEYMAP_NAME (AdbDevices),
 
     // panel
     ADD_KEYMAP_NAME (SelectExt),

@@ -4427,6 +4427,14 @@ panel_clean_dir (WPanel *panel)
     panel->total = 0;
     panel->quick_search.active = FALSE;
     panel->is_panelized = FALSE;
+    if (panel->is_adb_devices)
+    {
+        // leaving the device list: restore the previous display format
+        panel->list_format = panel->adb_saved_format;
+        panel->brief_cols = panel->adb_saved_brief_cols;
+        set_panel_formats (panel);
+    }
+    panel->is_adb_devices = FALSE;
     panel->dirty = TRUE;
     panel->content_shift = 0;
     panel->max_shift = 0;

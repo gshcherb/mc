@@ -16,6 +16,7 @@ LIBS += $(GLIB_LIBS)
 endif
 
 TESTS = \
+	adb_devices_build_command \
 	cd_to \
 	examine_cd \
 	exec_get_export_variables_ext \
@@ -25,6 +26,9 @@ TESTS = \
 	has_unquoted_metacharacters
 
 check_PROGRAMS = $(TESTS)
+
+adb_devices_build_command_SOURCES = \
+	adb_devices_build_command.c
 
 cd_to_SOURCES = \
 	cd_to.c

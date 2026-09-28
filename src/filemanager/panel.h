@@ -90,6 +90,10 @@ typedef struct
     gboolean is_panelized;               // Panelization: special mode, can't reload the file list
     panelized_descr_t *panelized_descr;  // Panelization descriptor
 
+    gboolean is_adb_devices;  // Panel shows the live ADB/fastboot device list, refreshed periodically
+    list_format_t adb_saved_format;  // Display format saved while showing the device list
+    int adb_saved_brief_cols;        // brief_cols saved while showing the device list
+
     int codepage;  // Panel codepage
 
     dir_list dir;          // Directory contents

@@ -33,9 +33,12 @@
 #include <config.h>
 
 #include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #ifdef ENABLE_VFS_NET
@@ -58,7 +61,8 @@
 #include "lib/file-entry.h"
 #include "lib/util.h"
 #include "lib/widget.h"
-#include "lib/keybind.h"  // CK_Down, CK_History
+#include "lib/widget/dialog-switch.h"  // top_dlg, filemanager
+#include "lib/keybind.h"               // CK_Down, CK_History
 #include "lib/event.h"    // mc_event_raise()
 
 #include "src/setup.h"
@@ -104,6 +108,9 @@ enum CompareMode
 };
 
 /*** forward declarations (file scope functions) *************************************************/
+
+static int adb_devices_timer_attention (int fd, void *data);
+static void adb_devices_timer_arm (void);
 
 /*** file scope variables ************************************************************************/
 
@@ -1414,6 +1421,444 @@ quick_view_cmd (void)
     if (PANEL (get_panel_widget (MENU_PANEL_IDX)) == current_panel)
         (void) change_panel ();
     create_panel (MENU_PANEL_IDX, view_quick);
+}
+
+/* --------------------------------------------------------------------------------------------- */
+
+/* NOTE: g_spawn_command_line_sync() does not run its argument through a
+ * shell, so the tools are executed with plain argv-style commands below
+ * (no braces, pipes or redirections). */
+
+char *
+adb_devices_build_command (adb_devices_tool_t tool)
+{
+    return g_strdup (tool == ADB_DEVICES_FASTBOOT ? "fastboot devices" : "adb devices -l");
+}
+
+/* --------------------------------------------------------------------------------------------- */
+/**
+ * Section header shown above each tool's devices in the panel.
+ *
+ * @return "[adb]" or "[fastboot]" (static string, do not free)
+ */
+
+const char *
+adb_devices_section_header (adb_devices_tool_t tool)
+{
+    return tool == ADB_DEVICES_FASTBOOT ? "[fastboot]" : "[adb]";
+}
+
+/* --------------------------------------------------------------------------------------------- */
+/**
+ * Parse one tool's output and append bare device lines to @entries.
+ *
+ * Each device line becomes one panel entry shown under the tool's section
+ * header. Headers, blank lines and daemon chatter are skipped.
+ *
+ * @param output command output, may be NULL
+ * @param entries array of strings to append to (takes ownership of new strings)
+ */
+
+void
+adb_devices_parse_tool_output (const char *output, GPtrArray *entries)
+{
+    char **lines;
+    int i;
+
+    if (output == NULL)
+        return;
+
+    lines = g_strsplit (output, "\n", -1);
+    for (i = 0; lines[i] != NULL; i++)
+    {
+        char *line = lines[i];
+        char *p;
+        size_t first_len;
+        const char *rest;
+
+        g_strstrip (line);
+        if (*line == '\0')
+            continue;
+        // adb header, daemon chatter and absolute-looking paths are not devices
+        if (g_str_has_prefix (line, "List of ") || line[0] == '*' || line[0] == '/')
+            continue;
+        // a device line is "<serial><blank><state>..."; anything else is noise
+        first_len = strcspn (line, " \t");
+        rest = line + first_len + strspn (line + first_len, " \t");
+        if (first_len == 0 || *rest == '\0')
+            continue;
+        // panel entries are single-line names: collapse tabs and carriage returns
+        for (p = line; *p != '\0'; p++)
+            if (*p == '\t' || *p == '\r')
+                *p = ' ';
+        g_ptr_array_add (entries, g_strdup (line));
+    }
+    g_strfreev (lines);
+}
+
+/* --------------------------------------------------------------------------------------------- */
+/**
+ * Build a placeholder entry for a tool that reported no devices.
+ *
+ * Shown under the tool's section header.
+ *
+ * @param detail optional reason (tool error output); flattened to a single
+ *               line, may be NULL or empty for plain "(no devices)"
+ * @return newly allocated entry name, e.g. "(no devices)"
+ */
+
+char *
+adb_devices_empty_placeholder (const char *detail)
+{
+    char *flat;
+    char *result;
+    char *p;
+
+    if (detail == NULL || *detail == '\0')
+        return g_strdup ("(no devices)");
+
+    flat = g_strdup (detail);
+    for (p = flat; *p != '\0'; p++)
+        if (*p == '\n' || *p == '\t' || *p == '\r')
+            *p = ' ';
+    g_strstrip (flat);
+    result = g_strdup_printf ("(%s)", flat);
+    g_free (flat);
+
+    return result;
+}
+
+/* --------------------------------------------------------------------------------------------- */
+
+/* Live refresh: while a panel shows the ADB/fastboot device list, the tools
+ * are re-run every second so newly attached devices appear. Implemented with
+ * SIGALRM plus a self-pipe registered as a select channel, so the main loop
+ * wakes up even when idle (same pattern as the SIGWINCH pipe). The timer is
+ * only armed while a device panel exists; any cd in that panel clears the
+ * flag (via panel_clean_dir) and the next tick disarms the timer. */
+#define ADB_DEVICES_REFRESH_USEC G_USEC_PER_SEC
+
+static int adb_devices_timer_pipe[2] = { -1, -1 };
+static gboolean adb_devices_timer_channel_added = FALSE;
+static gint64 adb_devices_last_refresh = 0;
+
+/* --------------------------------------------------------------------------------------------- */
+
+static void
+adb_devices_timer_signal (int signo)
+{
+    char c = '\0';
+    ssize_t ret;
+
+    (void) signo;
+
+    if (adb_devices_timer_pipe[1] != -1)
+    {
+        ret = write (adb_devices_timer_pipe[1], &c, 1);
+        (void) ret;
+    }
+}
+
+/* --------------------------------------------------------------------------------------------- */
+
+static void
+adb_devices_timer_set (gboolean enable)
+{
+    struct itimerval timer;
+
+    memset (&timer, 0, sizeof (timer));
+    if (enable)
+    {
+        timer.it_interval.tv_sec = 1;
+        timer.it_value.tv_sec = 1;
+    }
+    (void) setitimer (ITIMER_REAL, &timer, NULL);
+}
+
+/* --------------------------------------------------------------------------------------------- */
+
+static void
+adb_devices_timer_disarm (void)
+{
+    adb_devices_timer_set (FALSE);
+}
+
+/* --------------------------------------------------------------------------------------------- */
+/**
+ * Run both tools and collect panel entries.
+ *
+ * Layout per tool: a "[adb]"/"[fastboot]" header, then its devices (or a
+ * single placeholder), with a blank line separating the sections.
+ *
+ * The timer is disarmed while spawning so children never inherit an armed
+ * interval timer, and re-armed afterwards. Callers must guarantee that a
+ * device panel exists (it is created right after this call, or verified
+ * right before it).
+ *
+ * @return GPtrArray of newly allocated strings, never empty
+ */
+
+static GPtrArray *
+adb_devices_collect_entries (void)
+{
+    static const adb_devices_tool_t tools[] = { ADB_DEVICES_ADB, ADB_DEVICES_FASTBOOT };
+    GPtrArray *entries;
+    guint t;
+
+    entries = g_ptr_array_new_with_free_func (g_free);
+
+    adb_devices_timer_disarm ();
+
+    for (t = 0; t < G_N_ELEMENTS (tools); t++)
+    {
+        char *command;
+        char *output = NULL;
+        char *error_output = NULL;
+        gint exit_status = 0;
+        GError *error = NULL;
+        guint before;
+
+        g_ptr_array_add (entries, g_strdup (adb_devices_section_header (tools[t])));
+
+        command = adb_devices_build_command (tools[t]);
+        if (!g_spawn_command_line_sync (command, &output, &error_output, &exit_status, &error))
+        {
+            // e.g. tool binary not found on PATH: explain it in the panel
+            g_ptr_array_add (entries, adb_devices_empty_placeholder (error->message));
+            g_error_free (error);
+        }
+        else
+        {
+            before = entries->len;
+            adb_devices_parse_tool_output (output, entries);
+            if (entries->len == before)
+            {
+                // No devices: keep the reason (if any) visible in the panel
+                const char *detail =
+                    (exit_status != 0 && error_output != NULL && *error_output != '\0')
+                    ? error_output
+                    : NULL;
+
+                g_ptr_array_add (entries, adb_devices_empty_placeholder (detail));
+            }
+        }
+        g_free (command);
+        g_free (output);
+        g_free (error_output);
+
+        // blank line between sections, but not after the last one
+        if (t + 1 < G_N_ELEMENTS (tools))
+            g_ptr_array_add (entries, g_strdup (""));
+    }
+
+    adb_devices_timer_arm ();
+
+    // entries is never empty here: each tool contributes a header and more
+    return entries;
+}
+
+/* --------------------------------------------------------------------------------------------- */
+/**
+ * Fill @panel with the device @entries, preserving the selected entry by name.
+ *
+ * The panel is switched to a single-column brief listing so the section
+ * layout (headers, devices, blank separator) always renders one entry per
+ * line; the previous display format is saved and restored when the device
+ * list is replaced (see panel_clean_dir).
+ */
+
+static void
+adb_devices_refresh_panel (WPanel *panel, GPtrArray *entries)
+{
+    const file_entry_t *fe;
+    char *current = NULL;
+    dir_list *list;
+    struct stat st;
+    guint i;
+
+    fe = panel_current_entry (panel);
+    if (fe != NULL)
+        current = g_strndup (fe->fname->str, fe->fname->len);
+
+    if (!panel->is_adb_devices)
+    {
+        panel->adb_saved_format = panel->list_format;
+        panel->adb_saved_brief_cols = panel->brief_cols;
+    }
+
+    panel_clean_dir (panel);
+    panel_panelize_change_root (panel, panel->cwd_vpath);
+    list = &panel->dir;
+    dir_list_init (list);
+
+    // Synthetic entries: no real files behind them, read-only regular files
+    memset (&st, 0, sizeof (st));
+    st.st_mode = S_IFREG | 0444;
+
+    for (i = 0; i < entries->len; i++)
+    {
+        if (!dir_list_append (list, entries->pdata[i], &st, FALSE, FALSE))
+            break;
+        file_mark (panel, list->len - 1, 0);
+    }
+
+    panel->is_panelized = TRUE;
+    panel->is_adb_devices = TRUE;
+    panel->list_format = list_brief;
+    panel->brief_cols = 1;
+    set_panel_formats (panel);
+    panel_panelize_absolutize_if_needed (panel);
+    panel_panelize_save (panel);
+
+    panel_set_current_by_name (panel, current);
+    g_free (current);
+
+    // NOTE: no panel_re_sort() here: entries must stay in insertion order
+    // (section headers, then devices). A plain select repaints the listing.
+    select_item (panel);
+}
+
+/* --------------------------------------------------------------------------------------------- */
+
+static int
+adb_devices_timer_attention (int fd, void *data)
+{
+    WPanel *panels[2];
+    int count = 0;
+    int idx;
+    char buf[64];
+    GPtrArray *entries;
+    int i;
+
+    (void) data;
+
+    // drain the pipe (non-blocking); leftovers just trigger another pass
+    while (read (fd, buf, sizeof (buf)) > 0)
+        ;
+
+    // throttle to one refresh per second, no catch-up after stalls
+    if (!mc_time_elapsed (&adb_devices_last_refresh, ADB_DEVICES_REFRESH_USEC))
+        return 0;
+
+    for (idx = 0; idx < 2; idx++)
+    {
+        WPanel *panel;
+
+        if (get_panel_type (idx) != view_listing)
+            continue;
+        panel = PANEL (get_panel_widget (idx));
+        if (panel->is_adb_devices)
+            panels[count++] = panel;
+    }
+
+    if (count == 0)
+    {
+        adb_devices_timer_disarm ();
+        return 0;
+    }
+
+    // refresh only over the filemanager screen, never under viewer/editor/dialogs
+    if (top_dlg == NULL || top_dlg->data != (void *) filemanager)
+        return 0;
+
+    entries = adb_devices_collect_entries ();
+    for (i = 0; i < count; i++)
+        adb_devices_refresh_panel (panels[i], entries);
+    g_ptr_array_free (entries, TRUE);
+
+    // NOTE: no update_panels() here: it would re-stat the synthetic entries
+    // and drop them. A plain repaint shows the new listing, like external
+    // panelize does. Any cd in that panel restores the directory listing.
+    repaint_screen ();
+
+    return 0;
+}
+
+/* --------------------------------------------------------------------------------------------- */
+
+static void
+adb_devices_timer_arm (void)
+{
+    if (!adb_devices_timer_channel_added)
+    {
+        struct sigaction act;
+
+        if (pipe (adb_devices_timer_pipe) == -1)
+            return;
+        (void) fcntl (adb_devices_timer_pipe[0], F_SETFL, O_NONBLOCK);
+        (void) fcntl (adb_devices_timer_pipe[1], F_SETFL, O_NONBLOCK);
+
+        memset (&act, 0, sizeof (act));
+        act.sa_handler = adb_devices_timer_signal;
+        sigemptyset (&act.sa_mask);
+#ifdef SA_RESTART
+        act.sa_flags = SA_RESTART;
+#endif
+        my_sigaction (SIGALRM, &act, NULL);
+
+        add_select_channel (adb_devices_timer_pipe[0], adb_devices_timer_attention, NULL);
+        adb_devices_timer_channel_added = TRUE;
+    }
+
+    adb_devices_timer_set (TRUE);
+}
+
+/* --------------------------------------------------------------------------------------------- */
+
+/**
+ * Close the device list: re-read the panel's own directory. panel_clean_dir
+ * (via panel_do_cd) clears the live flag and restores the display format,
+ * and the refresh timer disarms itself on the next tick.
+ */
+
+static void
+adb_devices_restore_panel (WPanel *panel)
+{
+    (void) panel_do_cd (panel, panel->cwd_vpath, cd_exact);
+}
+
+/* --------------------------------------------------------------------------------------------- */
+
+void
+adb_devices_cmd (void)
+{
+    WPanel *panels[2];
+    int count = 0;
+    int idx;
+    GPtrArray *entries;
+    WPanel *panel;
+
+    // toggle: if the device list is displayed anywhere, close it
+    for (idx = 0; idx < 2; idx++)
+    {
+        WPanel *p;
+
+        if (get_panel_type (idx) != view_listing)
+            continue;
+        p = PANEL (get_panel_widget (idx));
+        if (p->is_adb_devices)
+            panels[count++] = p;
+    }
+
+    if (count != 0)
+    {
+        for (idx = 0; idx < count; idx++)
+            adb_devices_restore_panel (panels[idx]);
+        repaint_screen ();
+        return;
+    }
+
+    entries = adb_devices_collect_entries ();
+
+    // Show the results in the inactive panel, keep the active one as is
+    if (get_other_type () != view_listing)
+        create_panel (get_other_index (), view_listing);
+    panel = other_panel;
+
+    adb_devices_refresh_panel (panel, entries);
+    g_ptr_array_free (entries, TRUE);
+
+    repaint_screen ();
 }
 
 /* --------------------------------------------------------------------------------------------- */

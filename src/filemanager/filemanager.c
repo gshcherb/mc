@@ -265,6 +265,8 @@ create_command_menu (void)
     entries =
         g_list_prepend (entries, menu_entry_new (_ ("E&xternal panelize"), CK_ExternalPanelize));
     entries = g_list_prepend (entries, menu_entry_new (_ ("Show directory s&izes"), CK_DirSize));
+    entries =
+        g_list_prepend (entries, menu_entry_new (_ ("ADB/fastboot de&vices"), CK_AdbDevices));
     entries = g_list_prepend (entries, menu_separator_new ());
     entries = g_list_prepend (entries, menu_entry_new (_ ("Command &history"), CK_History));
     entries = g_list_prepend (
@@ -1250,6 +1252,9 @@ midnight_execute_cmd (Widget *sender, long command)
         break;
     case CK_MakeDir:
         mkdir_cmd (current_panel);
+        break;
+    case CK_AdbDevices:
+        adb_devices_cmd ();
         break;
     case CK_OptionsPanel:
         panel_options_box ();

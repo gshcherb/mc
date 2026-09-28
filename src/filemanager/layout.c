@@ -1276,6 +1276,9 @@ swap_panels (void)
         panelswap (top);
         panelswap (current);
         panelswap (is_panelized);
+        panelswap (is_adb_devices);
+        panelswap (adb_saved_format);
+        panelswap (adb_saved_brief_cols);
         panelswap (panelized_descr);
         panelswap (dir_stat);
 #undef panelswap

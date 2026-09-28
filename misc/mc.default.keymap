@@ -54,6 +54,7 @@ ScreenList = alt-prime
 # ConnectFtp =
 EditorViewerHistory = alt-shift-e
 ExtendedKeyMap = ctrl-x
+AdbDevices = alt-d
 
 [filemanager:xmap]
 ChangeMode = c

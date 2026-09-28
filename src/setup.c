@@ -1209,15 +1209,21 @@ panel_save_setup (WPanel *panel, const char *section)
 
     mc_config_set_string (mc_global.panels_config, section, "sort_order", panel->sort_field->id);
 
-    for (i = 0; list_formats[i].key != NULL; i++)
-        if (list_formats[i].list_format == (int) panel->list_format)
-        {
-            mc_config_set_string (mc_global.panels_config, section, "list_format",
-                                  list_formats[i].key);
-            break;
-        }
+    // a device panel shows a forced single-column format: persist the saved one instead
+    {
+        list_format_t list_format = panel->is_adb_devices ? panel->adb_saved_format : panel->list_format;
+        int brief_cols = panel->is_adb_devices ? panel->adb_saved_brief_cols : panel->brief_cols;
 
-    mc_config_set_int (mc_global.panels_config, section, "brief_cols", panel->brief_cols);
+        for (i = 0; list_formats[i].key != NULL; i++)
+            if (list_formats[i].list_format == (int) list_format)
+            {
+                mc_config_set_string (mc_global.panels_config, section, "list_format",
+                                      list_formats[i].key);
+                break;
+            }
+
+        mc_config_set_int (mc_global.panels_config, section, "brief_cols", brief_cols);
+    }
 
     mc_config_set_string (mc_global.panels_config, section, "user_format", panel->user_format);
 

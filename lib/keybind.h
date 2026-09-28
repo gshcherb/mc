@@ -211,6 +211,9 @@ enum
     CK_ScrollEnd,
     CK_CycleListingFormat,
 
+    // ADB/Fastboot
+    CK_AdbDevices = 250L,
+
     // dialog
     CK_Ok = 300L,
     CK_Cancel,

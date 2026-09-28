@@ -149,6 +149,8 @@ static const global_keymap_ini_t default_filemanager_keymap[] = {
     { "SelectInvert", "kpasterisk" },
     // List of screens
     { "ScreenList", "alt-prime" },
+    // Show combined adb/fastboot device list in the viewer
+    { "AdbDevices", "alt-d" },
     {
         NULL,
         NULL,

@@ -80,6 +80,17 @@ void quick_cmd_no_menu (void);
 void info_cmd_no_menu (void);
 void quick_view_cmd (void);
 void encoding_cmd (void);
+typedef enum
+{
+    ADB_DEVICES_ADB,
+    ADB_DEVICES_FASTBOOT
+} adb_devices_tool_t;
+
+char *adb_devices_build_command (adb_devices_tool_t tool);
+const char *adb_devices_section_header (adb_devices_tool_t tool);
+void adb_devices_parse_tool_output (const char *output, GPtrArray *entries);
+char *adb_devices_empty_placeholder (const char *detail);
+void adb_devices_cmd (void);
 /* achown.c */
 void advanced_chown_cmd (WPanel *panel);
 /* chmod.c */
